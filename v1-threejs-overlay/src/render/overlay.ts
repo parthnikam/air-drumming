@@ -1,9 +1,11 @@
 import * as THREE from 'three'
 import type { HandLandmarkerResult, NormalizedLandmark } from '@mediapipe/tasks-vision'
+import type { DrumPlayer } from '../audio/drumPlayer'
+import { createHitDetector, INDEX_TIP } from '../collision/hitDetector'
 import { HAND_CONNECTIONS, MAX_HANDS, MIRROR_VIDEO } from '../tracking/hand'
 import { createDrumKit } from './drumKit'
 
-export function createOverlay(app: HTMLElement, video: HTMLVideoElement) {
+export function createOverlay(app: HTMLElement, video: HTMLVideoElement, player?: DrumPlayer) {
   const scene = new THREE.Scene()
   const camera = new THREE.OrthographicCamera(0, 0, 0, 0, 0.1, 2000)
   camera.position.z = 1000
@@ -14,9 +16,11 @@ export function createOverlay(app: HTMLElement, video: HTMLVideoElement) {
 
   const jointGeometry = new THREE.SphereGeometry(7, 12, 12)
   const jointMaterial = new THREE.MeshBasicMaterial({ color: 0x35ff8a })
+  const indexTipMaterial = new THREE.MeshBasicMaterial({ color: 0xfff06a })
   const lineMaterial = new THREE.LineBasicMaterial({ color: 0x00d9ff })
-  const drumKit = createDrumKit(scene)
-  // Key + fill lights so cylindrical shells show volume (not flat discs)
+  const { kit: drumKit, instruments, flash } = createDrumKit(scene)
+  const hitDetector = createHitDetector(instruments)
+
   const keyLight = new THREE.DirectionalLight(0xffffff, 2.4)
   keyLight.position.set(220, 320, 700)
   const fillLight = new THREE.DirectionalLight(0xaaccff, 1.1)
@@ -32,8 +36,11 @@ export function createOverlay(app: HTMLElement, video: HTMLVideoElement) {
 
   const hands = Array.from({ length: MAX_HANDS }, () => {
     const points = Array.from({ length: 21 }, () => new THREE.Vector3())
-    const joints = points.map(() => {
-      const joint = new THREE.Mesh(jointGeometry, jointMaterial)
+    const joints = points.map((_, i) => {
+      const joint = new THREE.Mesh(
+        jointGeometry,
+        i === INDEX_TIP ? indexTipMaterial : jointMaterial,
+      )
       scene.add(joint)
       return joint
     })
@@ -43,6 +50,8 @@ export function createOverlay(app: HTMLElement, video: HTMLVideoElement) {
     scene.add(lines)
     return { points, joints, linePositions, lines }
   })
+
+  const indexTips: Array<THREE.Vector3 | null> = [null, null]
 
   const resize = () => {
     renderer.setSize(window.innerWidth, window.innerHeight)
@@ -70,12 +79,18 @@ export function createOverlay(app: HTMLElement, video: HTMLVideoElement) {
       const hand = hands[handIndex]
       hand.lines.visible = Boolean(landmarks)
       for (const joint of hand.joints) joint.visible = Boolean(landmarks)
-      if (!landmarks) continue
+
+      if (!landmarks) {
+        indexTips[handIndex] = null
+        continue
+      }
 
       for (let i = 0; i < 21; i += 1) {
         toScenePoint(landmarks[i], hand.points[i])
         hand.joints[i].position.copy(hand.points[i])
       }
+
+      indexTips[handIndex] = hand.points[INDEX_TIP]
 
       for (let i = 0; i < HAND_CONNECTIONS.length; i += 1) {
         hand.points[HAND_CONNECTIONS[i][0]].toArray(hand.linePositions, i * 6)
@@ -84,12 +99,27 @@ export function createOverlay(app: HTMLElement, video: HTMLVideoElement) {
       hand.lines.geometry.attributes.position.needsUpdate = true
     }
 
+    // World matrices must be current before local-space zone tests
+    drumKit.updateMatrixWorld(true)
+    const hits = hitDetector.update(indexTips)
+    for (const hit of hits) {
+      void player?.resume()
+      player?.playHit({
+        instrumentId: hit.instrumentId,
+        part: hit.part,
+        intensity: hit.intensity,
+      })
+      flash(hit.instrumentId, hit.intensity)
+    }
+
+    const tickFlash = drumKit.userData.tickFlash as ((now?: number) => void) | undefined
+    tickFlash?.(performance.now())
+
     renderer.render(scene, camera)
+    return hits
   }
 
   resize()
   window.addEventListener('resize', resize)
-  return { update }
+  return { update, instruments }
 }
-
-
